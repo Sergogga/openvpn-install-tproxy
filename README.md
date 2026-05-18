@@ -1,24 +1,61 @@
-**New: [wireguard-install](https://github.com/Nyr/wireguard-install) is also available.**
+# openvpn-install-tproxy
 
-## openvpn-install
-OpenVPN [road warrior](http://en.wikipedia.org/wiki/Road_warrior_%28computing%29) installer for Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS and Fedora.
+This is a focused fork of `nyr/openvpn-install` for VPS hosts where OpenVPN
+clients must be routed through local Xray/3x-ui policy routing instead of
+leaving the server through direct NAT.
 
-This script will let you set up your own VPN server in no more than a minute, even if you haven't used OpenVPN before. It has been designed to be as unobtrusive and universal as possible.
+The installer keeps the upstream OpenVPN workflow: run the script, answer the
+prompts, receive a client `.ovpn` profile, and rerun the script later to add or
+remove clients. The network behavior is different:
 
-### Installation
-Run the script and follow the assistant:
-
-```plain text
-wget https://git.io/vpn -O openvpn-install.sh && bash openvpn-install.sh
+```text
+OpenVPN client
+  -> OpenVPN server on the VPS
+  -> iptables TPROXY on the host
+  -> local Xray/3x-ui inbound on port 12345
+  -> Xray routing/outbounds
 ```
 
-Once it ends, you can run it again to add more users, remove some of them or even completely uninstall OpenVPN.
+## Fixed Contract
 
-### I want to run my own VPN but don't have a server for that
-You can get a VPS from just [2 EUR](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=1) or [2 USD](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=6) per month at [AlphaVPS](https://alphavps.com/clients/aff.php?aff=474&pid=457&currency=1).
+- OpenVPN client subnet: `10.12.14.0/24`
+- OpenVPN server address: `10.12.14.1`
+- Xray TPROXY inbound port: `12345`
+- Expected Xray inbound tag: `openvpn-tproxy`
+- Generated service: `openvpn-xray-tproxy.service`
+- Generated helper: `/usr/local/sbin/openvpn-xray-tproxy.sh`
 
-### Donations
-If you want to show your appreciation, you can donate via [PayPal](https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=VBAYDL34Z7J6L) or [cryptocurrency](https://pastebin.com/raw/M2JJpQpC). Thanks!
+The script does not install Xray, does not modify 3x-ui, and does not create
+direct `POSTROUTING` SNAT/MASQUERADE for OpenVPN clients. If the Xray TPROXY
+path is unavailable, client traffic is intended to fail closed instead of
+bypassing Xray through normal forwarding. OpenVPN client routing in this fork is
+IPv4-only.
 
-### Sponsors
-[Clever SaaS](https://www.clever-vpn.net/en?wg-referral=01LOULuQoi) – Launch your professional VPN service in 5 minutes. No tech team needed. Just $1.
+## Installation
+
+Run as root on a supported Ubuntu, Debian, AlmaLinux, Rocky Linux, CentOS, or
+Fedora server:
+
+```bash
+bash openvpn-install.sh
+```
+
+Before connecting clients, create the Xray/3x-ui transparent inbound separately.
+The required inbound is a `dokodemo-door` listener on port `12345` with
+`followRedirect` enabled and `sockopt.tproxy` set to `tproxy`.
+
+## Operations
+
+Useful checks after installation:
+
+```bash
+systemctl status openvpn-xray-tproxy.service
+ip rule show | grep fwmark
+ip route show table 100
+iptables -t mangle -vnL XRAY_OVPN
+iptables -t nat -S POSTROUTING | grep 10.12.14.0/24 || echo "OK: no direct SNAT"
+```
+
+Development documentation, tests, and agent planning files live on the `dev`
+branch. The `master` branch intentionally keeps only this README, the license,
+and the installer script.

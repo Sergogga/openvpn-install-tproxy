@@ -83,6 +83,157 @@ fi
 # Store the absolute path of the directory where the script is located
 script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Fork-specific: OpenVPN clients must enter local Xray/3x-ui TPROXY routing,
+# not exit through direct VPS NAT.
+OVPN_IPV4_NETWORK="10.12.14.0"
+OVPN_IPV4_NETMASK="255.255.255.0"
+OVPN_IPV4_CIDR="10.12.14.0/24"
+OVPN_IPV4_SERVER="10.12.14.1"
+XRAY_TPROXY_PORT="12345"
+XRAY_TPROXY_MARK="0x1/0x1"
+XRAY_FWMARK="1"
+XRAY_ROUTE_TABLE="100"
+XRAY_TPROXY_CHAIN="XRAY_OVPN"
+XRAY_TPROXY_SERVICE="openvpn-xray-tproxy.service"
+XRAY_TPROXY_SCRIPT="/usr/local/sbin/openvpn-xray-tproxy.sh"
+XRAY_TPROXY_TAG="openvpn-tproxy"
+XRAY_TPROXY_REFERENCE="/etc/openvpn/server/xray-tproxy-example.json"
+
+write_xray_tproxy_files() {
+	# Fork-specific: this helper is idempotent and captures only OpenVPN clients.
+	mkdir -p /usr/local/sbin /etc/systemd/system
+	cat > "$XRAY_TPROXY_SCRIPT" <<XRAY_TPROXY_SCRIPT
+#!/bin/bash
+set -euo pipefail
+
+OVPN_IPV4_CIDR="$OVPN_IPV4_CIDR"
+XRAY_TPROXY_PORT="$XRAY_TPROXY_PORT"
+XRAY_TPROXY_MARK="$XRAY_TPROXY_MARK"
+XRAY_FWMARK="$XRAY_FWMARK"
+XRAY_ROUTE_TABLE="$XRAY_ROUTE_TABLE"
+XRAY_TPROXY_CHAIN="$XRAY_TPROXY_CHAIN"
+
+iptables_path="\${IPTABLES_PATH:-\$(command -v iptables)}"
+ip_path="\${IP_PATH:-\$(command -v ip)}"
+
+if ! "\$ip_path" rule show | grep -Eq "fwmark (0x)?\${XRAY_FWMARK}(/0x[0-9a-f]+)? .*lookup \${XRAY_ROUTE_TABLE}"; then
+	"\$ip_path" rule add fwmark "\${XRAY_FWMARK}" table "\${XRAY_ROUTE_TABLE}"
+fi
+
+if ! "\$ip_path" route show table "\${XRAY_ROUTE_TABLE}" | grep -Eq '^local (default|0\.0\.0\.0/0) dev lo'; then
+	"\$ip_path" route add local 0.0.0.0/0 dev lo table "\${XRAY_ROUTE_TABLE}"
+fi
+
+"\$iptables_path" -w 5 -t mangle -N "\${XRAY_TPROXY_CHAIN}" 2>/dev/null || true
+"\$iptables_path" -w 5 -t mangle -F "\${XRAY_TPROXY_CHAIN}"
+
+"\$iptables_path" -w 5 -t mangle -A "\${XRAY_TPROXY_CHAIN}" -m mark --mark "\${XRAY_FWMARK}" -j RETURN
+for reserved_cidr in \\
+	0.0.0.0/8 \\
+	10.0.0.0/8 \\
+	100.64.0.0/10 \\
+	127.0.0.0/8 \\
+	169.254.0.0/16 \\
+	172.16.0.0/12 \\
+	192.0.0.0/24 \\
+	192.0.2.0/24 \\
+	192.168.0.0/16 \\
+	198.18.0.0/15 \\
+	198.51.100.0/24 \\
+	203.0.113.0/24 \\
+	224.0.0.0/4 \\
+	240.0.0.0/4; do
+	"\$iptables_path" -w 5 -t mangle -A "\${XRAY_TPROXY_CHAIN}" -d "\$reserved_cidr" -j RETURN
+done
+
+"\$iptables_path" -w 5 -t mangle -A "\${XRAY_TPROXY_CHAIN}" -p tcp -j TPROXY --on-port "\${XRAY_TPROXY_PORT}" --tproxy-mark "\${XRAY_TPROXY_MARK}"
+"\$iptables_path" -w 5 -t mangle -A "\${XRAY_TPROXY_CHAIN}" -p udp -j TPROXY --on-port "\${XRAY_TPROXY_PORT}" --tproxy-mark "\${XRAY_TPROXY_MARK}"
+
+if ! "\$iptables_path" -w 5 -t mangle -C PREROUTING -s "\${OVPN_IPV4_CIDR}" -j "\${XRAY_TPROXY_CHAIN}" 2>/dev/null; then
+	"\$iptables_path" -w 5 -t mangle -A PREROUTING -s "\${OVPN_IPV4_CIDR}" -j "\${XRAY_TPROXY_CHAIN}"
+fi
+
+while "\$iptables_path" -w 5 -C FORWARD -s "\${OVPN_IPV4_CIDR}" -j REJECT 2>/dev/null; do
+	"\$iptables_path" -w 5 -D FORWARD -s "\${OVPN_IPV4_CIDR}" -j REJECT
+done
+"\$iptables_path" -w 5 -I FORWARD 1 -s "\${OVPN_IPV4_CIDR}" -j REJECT
+XRAY_TPROXY_SCRIPT
+	chmod 755 "$XRAY_TPROXY_SCRIPT"
+
+	cat > "/etc/systemd/system/$XRAY_TPROXY_SERVICE" <<XRAY_TPROXY_SERVICE
+[Unit]
+Description=Route OpenVPN client traffic to Xray TPROXY inbound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$XRAY_TPROXY_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+XRAY_TPROXY_SERVICE
+
+	cat > "$XRAY_TPROXY_REFERENCE" <<XRAY_TPROXY_REFERENCE
+{
+  "inbounds": [
+    {
+      "tag": "$XRAY_TPROXY_TAG",
+      "listen": "0.0.0.0",
+      "port": $XRAY_TPROXY_PORT,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ]
+}
+XRAY_TPROXY_REFERENCE
+}
+
+cleanup_xray_tproxy() {
+	# Fork-specific: best-effort cleanup of generated TPROXY integration.
+	systemctl disable --now "$XRAY_TPROXY_SERVICE" 2>/dev/null || true
+	rm -f "/etc/systemd/system/$XRAY_TPROXY_SERVICE"
+
+	iptables_path=$(command -v iptables 2>/dev/null)
+	if [[ -n "$iptables_path" ]]; then
+		while "$iptables_path" -w 5 -t mangle -C PREROUTING -s "$OVPN_IPV4_CIDR" -j "$XRAY_TPROXY_CHAIN" 2>/dev/null; do
+			"$iptables_path" -w 5 -t mangle -D PREROUTING -s "$OVPN_IPV4_CIDR" -j "$XRAY_TPROXY_CHAIN"
+		done
+		"$iptables_path" -w 5 -t mangle -F "$XRAY_TPROXY_CHAIN" 2>/dev/null || true
+		"$iptables_path" -w 5 -t mangle -X "$XRAY_TPROXY_CHAIN" 2>/dev/null || true
+		while "$iptables_path" -w 5 -C FORWARD -s "$OVPN_IPV4_CIDR" -j REJECT 2>/dev/null; do
+			"$iptables_path" -w 5 -D FORWARD -s "$OVPN_IPV4_CIDR" -j REJECT
+		done
+	fi
+
+	ip_path=$(command -v ip 2>/dev/null)
+	if [[ -n "$ip_path" ]]; then
+		"$ip_path" rule del fwmark "$XRAY_FWMARK" table "$XRAY_ROUTE_TABLE" 2>/dev/null || true
+		"$ip_path" route del local 0.0.0.0/0 dev lo table "$XRAY_ROUTE_TABLE" 2>/dev/null || true
+	fi
+
+	rm -f "$XRAY_TPROXY_SCRIPT" "$XRAY_TPROXY_REFERENCE"
+	systemctl daemon-reload 2>/dev/null || true
+}
+
 if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 	# Detect some Debian minimal setups where neither wget nor curl are installed
 	if ! hash wget 2>/dev/null && ! hash curl 2>/dev/null; then
@@ -122,24 +273,6 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 			read -p "Public IPv4 address / hostname: " public_ip
 		done
 		[[ -z "$public_ip" ]] && public_ip="$get_public_ip"
-	fi
-	# If system has a single IPv6, it is selected automatically
-	if [[ $(ip -6 addr | grep -c 'inet6 [23]') -eq 1 ]]; then
-		ip6=$(ip -6 addr | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}')
-	fi
-	# If system has multiple IPv6, ask the user to select one
-	if [[ $(ip -6 addr | grep -c 'inet6 [23]') -gt 1 ]]; then
-		number_of_ip6=$(ip -6 addr | grep -c 'inet6 [23]')
-		echo
-		echo "Which IPv6 address should be used?"
-		ip -6 addr | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | nl -s ') '
-		read -p "IPv6 address [1]: " ip6_number
-		until [[ -z "$ip6_number" || "$ip6_number" =~ ^[0-9]+$ && "$ip6_number" -le "$number_of_ip6" ]]; do
-			echo "$ip6_number: invalid selection."
-			read -p "IPv6 address [1]: " ip6_number
-		done
-		[[ -z "$ip6_number" ]] && ip6_number="1"
-		ip6=$(ip -6 addr | grep 'inet6 [23]' | cut -d '/' -f 1 | grep -oE '([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}' | sed -n "$ip6_number"p)
 	fi
 	echo
 	echo "Which protocol should OpenVPN use?"
@@ -225,6 +358,11 @@ if [[ ! -e /etc/openvpn/server/server.conf ]]; then
 		fi
 	fi
 	read -n1 -r -p "Press any key to continue..."
+	# Fork-specific: TPROXY rules are installed with iptables even when firewalld
+	# is used only to open the OpenVPN listener port.
+	if ! hash iptables 2>/dev/null; then
+		firewall="${firewall:+$firewall }iptables"
+	fi
 	# If running inside a container, disable LimitNPROC to prevent conflicts
 	if systemd-detect-virt -cq; then
 		mkdir /etc/systemd/system/openvpn-server@server.service.d/ 2>/dev/null
@@ -289,14 +427,10 @@ dh dh.pem
 auth SHA512
 tls-crypt tc.key
 topology subnet
-server 10.8.0.0 255.255.255.0" > /etc/openvpn/server/server.conf
-	# IPv6
-	if [[ -z "$ip6" ]]; then
-		echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
-	else
-		echo 'server-ipv6 fddd:1194:1194:1194::/64' >> /etc/openvpn/server/server.conf
-		echo 'push "redirect-gateway def1 ipv6 bypass-dhcp"' >> /etc/openvpn/server/server.conf
-	fi
+server $OVPN_IPV4_NETWORK $OVPN_IPV4_NETMASK" > /etc/openvpn/server/server.conf
+	# Fork-specific: client routing is IPv4-only because the transparent Xray
+	# integration below captures the fixed OpenVPN IPv4 subnet.
+	echo 'push "redirect-gateway def1 bypass-dhcp"' >> /etc/openvpn/server/server.conf
 	echo 'ifconfig-pool-persist ipp.txt' >> /etc/openvpn/server/server.conf
 	# DNS
 	case "$dns" in
@@ -358,66 +492,36 @@ crl-verify crl.pem" >> /etc/openvpn/server/server.conf
 	echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-openvpn-forward.conf
 	# Enable without waiting for a reboot or service restart
 	echo 1 > /proc/sys/net/ipv4/ip_forward
-	if [[ -n "$ip6" ]]; then
-		# Enable net.ipv6.conf.all.forwarding for the system
-		echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-openvpn-forward.conf
-		# Enable without waiting for a reboot or service restart
-		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
-	fi
 	if systemctl is-active --quiet firewalld.service; then
 		# Using both permanent and not permanent rules to avoid a firewalld
 		# reload.
 		# We don't use --add-service=openvpn because that would only work with
 		# the default port and protocol.
 		firewall-cmd --add-port="$port"/"$protocol"
-		firewall-cmd --zone=trusted --add-source=10.8.0.0/24
 		firewall-cmd --permanent --add-port="$port"/"$protocol"
-		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
-		# Set NAT for the VPN subnet
-		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-		if [[ -n "$ip6" ]]; then
-			firewall-cmd --zone=trusted --add-source=fddd:1194:1194:1194::/64
-			firewall-cmd --permanent --zone=trusted --add-source=fddd:1194:1194:1194::/64
-			firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-			firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-		fi
 	else
 		# Create a service to set up persistent iptables rules
 		iptables_path=$(command -v iptables)
-		ip6tables_path=$(command -v ip6tables)
 		# nf_tables is not available as standard in OVZ kernels. So use iptables-legacy
 		# if we are in OVZ, with a nf_tables backend and iptables-legacy is available.
 		if [[ $(systemd-detect-virt) == "openvz" ]] && readlink -f "$(command -v iptables)" | grep -q "nft" && hash iptables-legacy 2>/dev/null; then
 			iptables_path=$(command -v iptables-legacy)
-			ip6tables_path=$(command -v ip6tables-legacy)
 		fi
 		echo "[Unit]
 After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
 ExecStart=$iptables_path -w 5 -I INPUT -p $protocol --dport $port -j ACCEPT
-ExecStart=$iptables_path -w 5 -I FORWARD -s 10.8.0.0/24 -j ACCEPT
-ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $ip
 ExecStop=$iptables_path -w 5 -D INPUT -p $protocol --dport $port -j ACCEPT
-ExecStop=$iptables_path -w 5 -D FORWARD -s 10.8.0.0/24 -j ACCEPT
-ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/openvpn-iptables.service
-		if [[ -n "$ip6" ]]; then
-			echo "ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
-ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to $ip6
-ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:1194:1194:1194::/64 -j ACCEPT
-ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" >> /etc/systemd/system/openvpn-iptables.service
-		fi
-		echo "RemainAfterExit=yes
+RemainAfterExit=yes
 [Install]
-WantedBy=multi-user.target" >> /etc/systemd/system/openvpn-iptables.service
+WantedBy=multi-user.target" > /etc/systemd/system/openvpn-iptables.service
 		systemctl enable --now openvpn-iptables.service
 	fi
+	write_xray_tproxy_files
+	systemctl daemon-reload
+	systemctl enable --now "$XRAY_TPROXY_SERVICE"
 	# If SELinux is enabled and a custom port was selected, we need this
 	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
 		# Install semanage if not already present
@@ -450,6 +554,18 @@ verb 3" > /etc/openvpn/server/client-common.txt
 	echo
 	echo "The client configuration is available in:" "$script_dir"/"$client.ovpn"
 	echo "New clients can be added by running this script again."
+	echo
+	echo "OpenVPN clients use $OVPN_IPV4_CIDR with server address $OVPN_IPV4_SERVER."
+	echo "Traffic is delivered to local Xray TPROXY port $XRAY_TPROXY_PORT."
+	echo "Create the 3x-ui/Xray inbound tagged \"$XRAY_TPROXY_TAG\" separately."
+	echo "Reference inbound example:" "$XRAY_TPROXY_REFERENCE"
+	echo
+	echo "Validation commands:"
+	echo "  systemctl status $XRAY_TPROXY_SERVICE"
+	echo "  ip rule show | grep fwmark"
+	echo "  ip route show table $XRAY_ROUTE_TABLE"
+	echo "  iptables -t mangle -vnL $XRAY_TPROXY_CHAIN"
+	echo "  iptables -t nat -S POSTROUTING | grep $OVPN_IPV4_CIDR || echo 'OK: no direct SNAT'"
 else
 	clear
 	echo "OpenVPN is already installed."
@@ -536,25 +652,14 @@ else
 				port=$(grep '^port ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				protocol=$(grep '^proto ' /etc/openvpn/server/server.conf | cut -d " " -f 2)
 				if systemctl is-active --quiet firewalld.service; then
-					ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.8.0.0/24 '"'"'!'"'"' -d 10.8.0.0/24' | grep -oE '[^ ]+$')
 					# Using both permanent and not permanent rules to avoid a firewalld reload.
 					firewall-cmd --remove-port="$port"/"$protocol"
-					firewall-cmd --zone=trusted --remove-source=10.8.0.0/24
 					firewall-cmd --permanent --remove-port="$port"/"$protocol"
-					firewall-cmd --permanent --zone=trusted --remove-source=10.8.0.0/24
-					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to "$ip"
-					if grep -qs "server-ipv6" /etc/openvpn/server/server.conf; then
-						ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:1194:1194:1194::/64 '"'"'!'"'"' -d fddd:1194:1194:1194::/64' | grep -oE '[^ ]+$')
-						firewall-cmd --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --permanent --zone=trusted --remove-source=fddd:1194:1194:1194::/64
-						firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-						firewall-cmd --permanent --direct --remove-rule ipv6 nat POSTROUTING 0 -s fddd:1194:1194:1194::/64 ! -d fddd:1194:1194:1194::/64 -j SNAT --to "$ip6"
-					fi
 				else
 					systemctl disable --now openvpn-iptables.service
 					rm -f /etc/systemd/system/openvpn-iptables.service
 				fi
+				cleanup_xray_tproxy
 				if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$port" != 1194 ]]; then
 					semanage port -d -t openvpn_port_t -p "$protocol" "$port"
 				fi
