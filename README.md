@@ -4,6 +4,11 @@ This is a focused fork of `nyr/openvpn-install` for VPS hosts where OpenVPN
 clients must be routed through local Xray/3x-ui policy routing instead of
 leaving the server through direct NAT.
 
+## Disclaimer
+
+This project was created to test the capabilities of the Codex AI agent. Review
+the generated changes before using the installer on a production server.
+
 The installer keeps the upstream OpenVPN workflow: run the script, answer the
 prompts, receive a client `.ovpn` profile, and rerun the script later to add or
 remove clients. The network behavior is different:
