@@ -1,0 +1,50 @@
+{
+  "inbounds": [
+    {
+      "tag": "openvpn-tproxy",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "openvpn-tproxy"
+        ],
+        "domain": [
+          "geosite:youtube"
+        ],
+        "outboundTag": "warp"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "openvpn-tproxy"
+        ],
+        "network": "tcp,udp",
+        "outboundTag": "direct"
+      }
+    ]
+  }
+}
